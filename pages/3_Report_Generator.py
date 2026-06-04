@@ -5,7 +5,7 @@ Report Generator — download formatted Excel reports
 import streamlit as st
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from engines import GLOBAL_CSS, THEME, process_osa, build_osa_excel, process_sos, build_sos_excel, load_pressure_targets, inject_sidebar_toggle, inject_theme_toggle, load_pressure_targets
+from engines import GLOBAL_CSS, THEME, process_osa, build_osa_excel, process_sos, build_sos_excel, load_pressure_targets, merge_sos_chunks, inject_sidebar_toggle, inject_theme_toggle, mhsku_load
 from auth import require_login, logout
 from datetime import datetime
 
@@ -73,17 +73,42 @@ with pt_col:
     osa_pt_file = st.file_uploader("Upload Pressure Targets .xlsx", type=["xlsx"],
                                     key="osa_pt_upload", label_visibility="collapsed")
 
+# ── Auto-load MHSKU memory as pressure targets fallback ──────────────────────
+mhsku_records, mhsku_ts, mhsku_by = mhsku_load()
+if mhsku_records:
+    st.markdown(
+        f"<div style='font-size:12px;color:#34c97b;background:rgba(52,201,123,.08);"
+        f"border:1px solid rgba(52,201,123,.2);border-radius:8px;padding:8px 14px;margin-bottom:12px'>"
+        f"✅ <strong>MHSKU Reference loaded from memory</strong> — {len(mhsku_records)} SKUs "
+        f"(last updated by {mhsku_by or 'unknown'}). "
+        f"These pressure targets will be applied automatically if no file is uploaded above.</div>",
+        unsafe_allow_html=True,
+    )
+    _mem_targets = {r["code"]: r["pressure_target"] for r in mhsku_records}
+else:
+    _mem_targets = None
+
 if osa_file:
     if st.button("⚡  Generate OSA Report", key="osa_btn", use_container_width=True):
         try:
+            with st.spinner("Reading file…"):
+                file_bytes = osa_file.read()
+                pt_bytes   = osa_pt_file.read() if osa_pt_file else None
             with st.spinner("Building OSA report…"):
-                file_bytes     = osa_file.read()
-                pt_bytes       = osa_pt_file.read() if osa_pt_file else None
-                targets        = load_pressure_targets(pt_bytes) if pt_bytes else None
-                df_osa         = process_osa(file_bytes, osa_file.name, targets_override=targets)
-                xlsx_bytes     = build_osa_excel(df_osa)
-                fname          = f"OSA_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                n_overrides    = len(targets) if targets else 0
+                # Targets: uploaded file > MHSKU memory > none
+                if pt_bytes:
+                    targets = load_pressure_targets(pt_bytes)
+                    del pt_bytes
+                elif _mem_targets:
+                    targets = _mem_targets
+                else:
+                    targets = None
+                df_osa     = process_osa(file_bytes, osa_file.name, targets_override=targets)
+                del file_bytes  # release raw bytes once processed
+                xlsx_bytes = build_osa_excel(df_osa)
+                del df_osa      # release processed df once Excel built
+                fname      = f"OSA_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                n_overrides = len(targets) if targets else 0
             st.session_state["osa_xlsx"]      = xlsx_bytes
             st.session_state["osa_fname"]     = fname
             st.session_state["osa_error"]     = None
@@ -122,17 +147,36 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-sos_file = st.file_uploader("Upload SOS .xlsx file", type=["xlsx"],
-                             key="sos_upload", label_visibility="collapsed")
+sos_files = st.file_uploader(
+    "Upload SOS .xlsx file(s) — select multiple if your export is split into chunks",
+    type=["xlsx"], key="sos_upload", label_visibility="collapsed",
+    accept_multiple_files=True,
+)
 
-if sos_file:
+if sos_files:
+    if len(sos_files) > 1:
+        st.markdown(
+            f'<div style="font-size:12px;color:#4f8ef7;background:rgba(79,142,247,.08);border:1px solid rgba(79,142,247,.2);border-radius:8px;padding:6px 14px;margin-bottom:8px">' +
+            f'📂 {len(sos_files)} files selected — will be merged before building report.</div>',
+            unsafe_allow_html=True,
+        )
     if st.button("⚡  Generate SOS Report", key="sos_btn", use_container_width=True):
         try:
-            with st.spinner("Building SOS report…"):
-                file_bytes = sos_file.read()
-                df_sos     = process_sos(file_bytes)
+            with st.spinner("Reading file(s)…"):
+                all_bytes = [f.read() for f in sos_files]
+                all_names = [f.name for f in sos_files]
+            with st.spinner("Merging & building SOS report…" if len(sos_files) > 1 else "Building SOS report…"):
+                if len(all_bytes) > 1:
+                    merged_bytes = merge_sos_chunks(all_bytes)
+                    del all_bytes
+                    df_sos = process_sos(merged_bytes, "merged_sos.xlsx")
+                    del merged_bytes
+                else:
+                    df_sos = process_sos(all_bytes[0], all_names[0])
+                    del all_bytes
                 xlsx_bytes = build_sos_excel(df_sos)
-                fname      = f"SOS_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                del df_sos
+                fname = f"SOS_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             st.session_state["sos_xlsx"]  = xlsx_bytes
             st.session_state["sos_fname"] = fname
             st.session_state["sos_error"] = None

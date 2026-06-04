@@ -70,7 +70,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     if st.button("🟢\n\nOSA Analytics\n\nOn-Shelf Availability — charts by brand, category, account & week.\n\n→ Open", key="nav_osa", use_container_width=True):
         st.switch_page("pages/1_OSA_Analytics.py")
@@ -80,6 +80,9 @@ with c2:
 with c3:
     if st.button("⬇️\n\nReport Generator\n\nDownload fully formatted OSA & SOS Excel reports instantly.\n\n→ Open", key="nav_rpt", use_container_width=True):
         st.switch_page("pages/3_Report_Generator.py")
+with c4:
+    if st.button("📋\n\nMHSKU Reference\n\nMust Have SKU list with targets — shared persistent memory.\n\n→ Open", key="nav_mhsku", use_container_width=True):
+        st.switch_page("pages/4_MHSKU_Reference.py")
 
 st.markdown("""
 <div class="legend-row">

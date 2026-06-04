@@ -50,6 +50,16 @@ def logout():
     st.rerun()
 
 
+def is_admin() -> bool:
+    """Return True if the currently logged-in user is an admin."""
+    user = st.session_state.get("username", "").strip().lower()
+    try:
+        admin_users = [u.strip().lower() for u in st.secrets.get("admin_users", ["admin"])]
+    except Exception:
+        admin_users = ["admin"]
+    return user in admin_users
+
+
 # ── Login page UI ─────────────────────────────────────────────────────────────
 
 def _show_login_page():

@@ -4,6 +4,7 @@ Imported by all pages.
 """
 
 import io
+import itertools
 import pandas as pd
 import numpy as np
 import openpyxl
@@ -88,11 +89,14 @@ def osa_color(val):
     if val >= 80: return t["amber"]
     return t["red"]
 
-def sos_color(val):
+def sos_color(val, target: int = None):
+    """Return theme colour for an SOS value vs its category target."""
     t = get_theme()
+    thr = target if target is not None else SOS_GREEN_THR
     if __import__('pandas').isna(val) or val == 0: return t["red"]
-    if val >= 20: return t["green"]
-    return t["amber"]
+    if val >= thr:            return t["green"]
+    if val >= thr * 0.5:      return t["amber"]
+    return t["red"]
 
 # Keep for backward compat
 PLOTLY_LAYOUT = dict(
@@ -593,22 +597,86 @@ def process_osa(file_bytes: bytes, filename: str = "",
     """
     fname = filename.lower()
 
-    # ── Load ──────────────────────────────────────────────────────────────────
+    # ── Load (large-file optimised — handles up to 300 MB) ───────────────────
     if fname.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(file_bytes))
+        df = read_large_csv(file_bytes)
     else:
         # Try Excel with OSA sheet first, fall back to first sheet, then CSV
         try:
             try:
-                df = pd.read_excel(io.BytesIO(file_bytes), sheet_name='OSA')
+                df = read_large_excel(file_bytes, sheet_name='OSA')
             except Exception:
-                df = pd.read_excel(io.BytesIO(file_bytes))
+                df = read_large_excel(file_bytes, sheet_name=0)
         except Exception:
-            # Last resort: try as CSV (some exports have wrong extension)
-            df = pd.read_csv(io.BytesIO(file_bytes))
+            df = read_large_csv(file_bytes)
+
+    # ── Normalise column names ────────────────────────────────────────────────
+    _OSA_DATE_ALIASES = [
+        "date reported", "date_reported", "visit date", "date created",
+        "date_created", "survey date", "submission date", "date", "created date",
+    ]
+    col_lower = {c.lower().strip(): c for c in df.columns}
+    if 'DATE REPORTED' not in df.columns:
+        for alias in _OSA_DATE_ALIASES:
+            if alias in col_lower:
+                df = df.rename(columns={col_lower[alias]: 'DATE REPORTED'})
+                break
+        else:
+            available = ", ".join(f"'{c}'" for c in df.columns[:20])
+            raise ValueError(
+                f"Could not find a date column in your OSA file. "
+                f"Expected 'DATE REPORTED' or similar. "
+                f"Columns found: {available}"
+            )
+
+    # Remap other common OSA column variants
+    _OSA_COL_ALIASES = {
+        "CUSTOMER NAME":   ["customer name", "customer_name", "outlet", "outlet name", "store name", "store"],
+        "BRAND NAME":      ["brand name", "brand_name", "brand", "product brand"],
+        "PRODUCT CATEGORY":["product category", "product_category", "category", "cat"],
+        "PRODUCT CODE":    ["product code", "product_code", "sku code", "item code", "code"],
+        "PRESSURE TARGET": ["pressure target", "pressure_target", "target", "pt"],
+        "QUANTITY":        ["quantity", "qty", "stock qty", "count"],
+        "STOCK LEVEL":     ["stock level", "stock_level", "availability", "available"],
+        "COUNTRY":         ["country", "country name", "country_name", "nation"],
+        "REGION":          ["region", "territory", "area", "district"],
+    }
+    col_lower = {c.lower().strip(): c for c in df.columns}
+    renames = {}
+    for canonical, aliases in _OSA_COL_ALIASES.items():
+        if canonical in df.columns:
+            continue
+        for alias in aliases:
+            if alias in col_lower:
+                renames[col_lower[alias]] = canonical
+                break
+    if renames:
+        df = df.rename(columns=renames)
+
+    # ── Early filters — shrink the frame BEFORE expensive operations ───────────
+    # Filter Uganda brands first (biggest row reduction on multi-country exports)
+    _UG_REGION_KEYWORDS = [
+        'kampala', 'uganda', 'entebbe', 'jinja', 'mbarara', 'gulu',
+        'wakiso', 'mukono', 'lira', 'mbale', 'arua', 'masaka',
+    ]
+    if 'BRAND NAME' in df.columns:
+        df = df[df['BRAND NAME'].apply(is_ug_osa_brand)].copy()
+
+    # Filter Uganda outlets (drop Kenya / other-country rows early)
+    if 'COUNTRY' in df.columns:
+        mask_ug = df['COUNTRY'].str.strip().str.lower().isin(['uganda', 'ug'])
+        df = df[mask_ug].copy()
+    elif 'REGION' in df.columns:
+        mask_ug = df['REGION'].str.strip().str.lower().apply(
+            lambda r: any(kw in r for kw in _UG_REGION_KEYWORDS) if isinstance(r, str) else False
+        )
+        df = df[mask_ug].copy()
 
     # ── Parse dates ───────────────────────────────────────────────────────────
-    df['DATE_PARSED'] = pd.to_datetime(df['DATE REPORTED'], errors='coerce')
+    # Smart date parsing — ISO format (YYYY-MM-DD) must NOT use dayfirst
+    _osa_sample = df['DATE REPORTED'].dropna().astype(str).head(20)
+    _osa_iso = _osa_sample.str.match(r'^\d{4}[-/]\d').any()
+    df['DATE_PARSED'] = pd.to_datetime(df['DATE REPORTED'], errors='coerce', dayfirst=not _osa_iso)
     df = df[df['DATE_PARSED'].notna()].copy()
 
     # ── Derive Month if missing ───────────────────────────────────────────────
@@ -659,6 +727,13 @@ def process_osa(file_bytes: bytes, filename: str = "",
             if c in n: return c
         return name
     df['ACCOUNT'] = df['CUSTOMER NAME'].apply(get_account)
+
+    # ── Canonicalise PRODUCT CATEGORY to focus categories ────────────────────
+    if 'PRODUCT CATEGORY' in df.columns:
+        df['PRODUCT CATEGORY'] = (df['PRODUCT CATEGORY']
+                                   .str.upper().str.strip()
+                                   .map(lambda c: UG_CATEGORY_CANONICAL.get(c, c)))
+
     return df
 
 
@@ -799,6 +874,133 @@ SOS_KEY_ACCOUNTS = [
 ]
 SOS_GREEN_THR = 20
 BLOCKS_PER_ROW = 5
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  UGANDA BRAND & SOS TARGET CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Definitive Uganda brand list — sourced from Items_Range_Uganda_March_26.xlsx ──
+# Only these 5 brands are tracked. Anything else is excluded from all charts and filters.
+# Prefixes cover all known SFA export variants (e.g. "Tishu Poa", "TISHUPOA", "TISHU POA").
+UG_BRANDS = [
+    'FAY',       # 53 SKUs — widest range across all categories
+    'COSY',      # 1 SKU  — Serviettes
+    'SIFA',      # 3 SKUs — Toilet Paper
+    'TISHU POA', # 4 SKUs — Toilet Paper
+    'ULTRA',     # 12 SKUs — Scouring Pads / Cleaners
+]
+
+# SFA sometimes exports brand names with variants — map all to canonical names above
+UG_BRAND_ALIASES = {
+    'TISHU':       'TISHU POA',
+    'TISHUPOA':    'TISHU POA',
+    'SIFA TP':     'SIFA',
+    'COSY POA':    'COSY',
+    'ULTRA CLEAN': 'ULTRA',
+}
+
+# SOS targets per category — exactly as per the MT SOS Target table
+UG_SOS_TARGETS = {
+    # Primary names (as shown in table)
+    'TOILET PAPER':            30,
+    'SERVIETTES':              30,
+    'KITCHEN TOWELS':          40,
+    'ALUMINUM FOILS':          40,
+    'CLING FILM':              40,
+    'FACIALS':                 40,
+    'MULTIFOLDS HAND TOWELS':  50,
+    'ULTRA SCOURERS':          20,
+    'BAKING PAPER':            50,
+    'WIPES':                   20,
+    # Aliases that appear in SFA data exports
+    'ALUMINIUM FOIL':          40,
+    'ALLUMINIUM FOIL':         40,
+    'HAND TOWEL':              50,
+    'HAND TOWELS':             50,
+    'MULTIFOLD HAND TOWELS':   50,
+    'SCOURERS':                20,
+    'SCOURING PADS':           20,
+    'LARGE WIPES':             20,
+    'POCKET WIPES':            20,
+}
+
+# The 10 focus categories shown in charts — matches the MT SOS Target table exactly.
+# Any category NOT in this set is excluded from the category-level SOS charts.
+UG_FOCUS_CATEGORIES = {
+    'TOILET PAPER',
+    'SERVIETTES',
+    'KITCHEN TOWELS',
+    'ALUMINUM FOILS',
+    'CLING FILM',
+    'FACIALS',
+    'MULTIFOLDS HAND TOWELS',
+    'ULTRA SCOURERS',
+    'BAKING PAPER',
+    'WIPES',
+}
+
+# Mapping from SFA export variant → canonical focus category name
+UG_CATEGORY_CANONICAL = {
+    'TOILET PAPER':           'TOILET PAPER',
+    'SERVIETTES':             'SERVIETTES',
+    'KITCHEN TOWELS':         'KITCHEN TOWELS',
+    'ALUMINUM FOILS':         'ALUMINUM FOILS',
+    'ALUMINIUM FOIL':         'ALUMINUM FOILS',
+    'ALLUMINIUM FOIL':        'ALUMINUM FOILS',
+    'CLING FILM':             'CLING FILM',
+    'FACIALS':                'FACIALS',
+    'MULTIFOLDS HAND TOWELS': 'MULTIFOLDS HAND TOWELS',
+    'MULTIFOLD HAND TOWELS':  'MULTIFOLDS HAND TOWELS',
+    'HAND TOWEL':             'MULTIFOLDS HAND TOWELS',
+    'HAND TOWELS':            'MULTIFOLDS HAND TOWELS',
+    'ULTRA SCOURERS':         'ULTRA SCOURERS',
+    'SCOURERS':               'ULTRA SCOURERS',
+    'SCOURING PADS':          'ULTRA SCOURERS',
+    'BAKING PAPER':           'BAKING PAPER',
+    'WIPES':                  'WIPES',
+    'LARGE WIPES':            'WIPES',
+    'POCKET WIPES':           'WIPES',
+}
+
+# ── Brand matching — used by both OSA ('BRAND NAME') and SOS ('PRODUCT_NAME') ──
+# Exact prefixes derived from Items_Range_Uganda_March_26.xlsx
+_UG_BRAND_PREFIXES = [b.upper() for b in UG_BRANDS]  # ['FAY', 'COSY', 'SIFA', 'TISHU POA', 'ULTRA']
+_UG_ALIAS_KEYS     = [k.upper() for k in UG_BRAND_ALIASES]
+
+def _matches_ug_brand(n: str) -> bool:
+    """Core match: True if normalised uppercase name n starts with any UG brand prefix
+    or exactly equals any known alias."""
+    # Check aliases first (exact match on full name)
+    if n in _UG_ALIAS_KEYS:
+        return True
+    # Check prefixes — name must START with a brand prefix
+    return any(n.startswith(b) for b in _UG_BRAND_PREFIXES)
+
+def is_ug_osa_brand(name: str) -> bool:
+    """Return True if the OSA BRAND NAME belongs to a Uganda-tracked brand."""
+    if not name or not isinstance(name, str):
+        return False
+    return _matches_ug_brand(name.upper().strip())
+
+def is_ug_brand(name: str) -> bool:
+    """Return True if the SOS PRODUCT_NAME belongs to a Uganda-tracked brand."""
+    if not name or not isinstance(name, str):
+        return False
+    return _matches_ug_brand(name.upper().strip())
+
+def get_sos_target(category: str) -> int:
+    """Return the MT SOS target % for a given category."""
+    if not category:
+        return 20
+    cat = str(category).upper().strip()
+    return UG_SOS_TARGETS.get(cat, 20)  # default 20% if not in table
+
+def sos_color_for_target(val: float, target: int) -> str:
+    """Return 'green', 'amber', or 'red' based on actual vs category target."""
+    if val >= target:        return 'green'
+    if val >= target * 0.5:  return 'amber'
+    return 'red'
+
 GAP_COLS       = 1
 ACCT_COLORS    = [
     ('1F4E79','FFFFFF'),('375623','FFFFFF'),('7B2C2C','FFFFFF'),
@@ -807,37 +1009,600 @@ ACCT_COLORS    = [
 _thin2 = Side(style='thin', color='BFBFBF')
 def _sos_bdr(): return Border(left=_thin2, right=_thin2, top=_thin2, bottom=_thin2)
 
-def _sos_fill_xl(val):
-    if pd.isna(val) or val==0: return PatternFill('solid', fgColor='FFC7CE')
-    if val >= SOS_GREEN_THR:   return PatternFill('solid', fgColor='C6EFCE')
-    return PatternFill('solid', fgColor='FFEB9C')
+def _sos_fill_xl(val, target: int = None):
+    """Colour-code an SOS value against its category target.
+    Falls back to SOS_GREEN_THR (20%) when no target supplied.
+    """
+    t = target if target is not None else SOS_GREEN_THR
+    if pd.isna(val) or val == 0:  return PatternFill('solid', fgColor='FFC7CE')  # red
+    if val >= t:                   return PatternFill('solid', fgColor='C6EFCE')  # green
+    return PatternFill('solid', fgColor='FFEB9C')                                 # amber
 
 
-def process_sos(file_bytes: bytes) -> pd.DataFrame:
-    """Run the full SOS pipeline and return the enriched DataFrame."""
-    df = pd.read_excel(io.BytesIO(file_bytes))
-    df['DATE_PARSED'] = pd.to_datetime(df['DATE CREATED'], errors='coerce')
+# ─────────────────────────────────────────────────────────────────────────────
+#  SOS FORMAT DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_sos_format(df: pd.DataFrame) -> str:
+    """
+    Return 'survey' for the standard DATE CREATED/FACINGS SOS% format,
+    or 'negotiated' for the SHOP NAME/BRAND GROUP/FACING SOS planogram format.
+    """
+    cols_lower = {c.lower().strip() for c in df.columns}
+    # Negotiated format has these distinctive columns
+    negotiated_signals = {"brand group", "facing sos", "length sos", "area sos", "shop name"}
+    if len(negotiated_signals & cols_lower) >= 3:
+        return "negotiated"
+    return "survey"
+
+
+def _map_chain(name: str) -> str | None:
+    """Map a shop/outlet name to its parent chain using SOS_KEY_ACCOUNTS keywords."""
+    if not name or (isinstance(name, float)):
+        return None
+    n = str(name).upper().strip()
+    for label, kws in SOS_KEY_ACCOUNTS:
+        if any(k in n for k in kws):
+            return label
+    # Also try common chains not in SOS_KEY_ACCOUNTS
+    for chain in ['CARREFOUR','NAIVAS','QUICKMART','CHANDARANA','KHETIAS',
+                  'CLEANSHELF','MAGUNAS','EASTMATT','DEFCO','MATHAI',
+                  'POWERSTAR','KASSMATT','LEESTAR','SKYMATT','JAZA']:
+        if chain in n:
+            return chain
+    return None  # unrecognised outlet — exclude from analysis
+
+
+def merge_sos_chunks(chunk_bytes_list: list[bytes]) -> bytes:
+    """
+    Merge multiple SOS export files (same column structure) into one.
+    Returns combined bytes as an in-memory xlsx so process_sos() can
+    handle it with a single call.
+
+    De-duplicates rows by all columns to handle overlapping exports.
+    """
+    dfs = []
+    for fb in chunk_bytes_list:
+        wb = openpyxl.load_workbook(io.BytesIO(fb), read_only=True, data_only=True)
+        ws = wb.active
+        row_iter = ws.iter_rows(values_only=True)
+        header = next(row_iter, None)
+        if header is None:
+            wb.close()
+            continue
+        chunk_df = pd.DataFrame(row_iter, columns=header)
+        wb.close()
+        dfs.append(chunk_df)
+
+    if not dfs:
+        raise ValueError("No valid data found in uploaded files.")
+
+    combined = pd.concat(dfs, ignore_index=True)
+    # Drop exact duplicates that can appear in overlapping exports
+    combined = combined.drop_duplicates()
+
+    # Write back to xlsx bytes so process_sos() can consume it normally
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        combined.to_excel(writer, index=False, sheet_name="Worksheet")
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def process_sos_negotiated(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Process the negotiated/planogram SOS format.
+    Columns: ACCOUNT | SHOP NAME | REGION | CATEGORY | DISPLAY TYPE |
+             BRAND GROUP | TARGET SOS | LENGTH SOS | FACING SOS | AREA SOS |
+             LENGTH VARIANCE | FACING VARIANCE | AREA VARIANCE
+
+    Returns a normalised DataFrame compatible with the analytics pages,
+    with synthetic MONTH/MONTH_NUM set to 'Snapshot' / 0.
+    """
+    df = read_large_excel(file_bytes, sheet_name=0)
+
+    # Normalise column names
+    renames = {}
+    col_lower = {c.lower().strip(): c for c in df.columns}
+    alias_map = {
+        'SHOP NAME':    ['shop name','outlet name','store name','customer name'],
+        'BRAND GROUP':  ['brand group','brand','product_name','product name','sku'],
+        'CATEGORY':     ['category','product category','cat'],
+        'REGION':       ['region','territory','area'],
+        'COUNTRY':      ['country','country name','country_name','nation'],
+        'FACING SOS':   ['facing sos','facings sos','facings sos%','sos%','sos','facing sos%'],
+        'TARGET SOS':   ['target sos','target','sos target'],
+        'FACING VARIANCE': ['facing variance','variance'],
+    }
+    for canonical, aliases in alias_map.items():
+        if canonical not in df.columns:
+            for a in aliases:
+                if a in col_lower:
+                    renames[col_lower[a]] = canonical
+                    break
+    if renames:
+        df = df.rename(columns=renames)
+
+    # Ensure required columns exist
+    for col in ('FACING SOS', 'TARGET SOS', 'FACING VARIANCE'):
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # Map shop to chain
+    df['ACCOUNT'] = df['SHOP NAME'].apply(_map_chain)
+
+    # Add synthetic time columns so analytics pages don't break
+    df['DATE_PARSED'] = pd.NaT
+    df['MONTH']       = 'Snapshot'
+    df['MONTH_NUM']   = 0
+
+    # Rename to canonical SOS analytics column names
+    df = df.rename(columns={
+        'BRAND GROUP': 'PRODUCT_NAME',
+        'CATEGORY':    'PRODUCT_CATEGORY',
+        'FACING SOS':  'FACINGS SOS%',
+        'SHOP NAME':   'CUSTOMER NAME',
+    })
+
+    # Add POSITION as NaN (not in this format)
+    if 'POSITION' not in df.columns:
+        df['POSITION'] = np.nan
+
+    # ── Coerce FACINGS SOS% to numeric ────────────────────────────────────────
+    if 'FACINGS SOS%' in df.columns:
+        sos_raw = df['FACINGS SOS%'].astype(str).str.strip().str.rstrip('%')
+        df['FACINGS SOS%'] = pd.to_numeric(sos_raw, errors='coerce')
+        frac_mask = df['FACINGS SOS%'].notna() & (df['FACINGS SOS%'] <= 1.0) & (df['FACINGS SOS%'] > 0)
+        df.loc[frac_mask, 'FACINGS SOS%'] = df.loc[frac_mask, 'FACINGS SOS%'] * 100
+
+    # ── Filter to Uganda brands only ──────────────────────────────────────────
+    ug_mask = df['PRODUCT_NAME'].apply(is_ug_brand)
+    df = df[ug_mask].copy()
+
+    # ── Filter to Uganda outlets only ─────────────────────────────────────────
+    _UG_REGION_KEYWORDS = [
+        'kampala', 'uganda', 'entebbe', 'jinja', 'mbarara', 'gulu',
+        'wakiso', 'mukono', 'lira', 'mbale', 'arua', 'masaka',
+    ]
+    if 'COUNTRY' in df.columns:
+        mask_ug = df['COUNTRY'].str.strip().str.lower().isin(['uganda', 'ug'])
+        df = df[mask_ug].copy()
+    elif 'REGION' in df.columns:
+        mask_ug = df['REGION'].str.strip().str.lower().apply(
+            lambda r: any(kw in r for kw in _UG_REGION_KEYWORDS) if isinstance(r, str) else False
+        )
+        df = df[mask_ug].copy()
+
+    # ── Canonicalise category names ───────────────────────────────────────────
+    if 'PRODUCT_CATEGORY' in df.columns:
+        df['PRODUCT_CATEGORY'] = (df['PRODUCT_CATEGORY']
+                                   .str.upper().str.strip()
+                                   .map(lambda c: UG_CATEGORY_CANONICAL.get(c, c)))
+
+    # ── Attach category SOS target ────────────────────────────────────────────
+    if 'PRODUCT_CATEGORY' in df.columns:
+        df['SOS_TARGET'] = df['PRODUCT_CATEGORY'].apply(get_sos_target)
+    else:
+        df['SOS_TARGET'] = 20
+
+    return df
+
+
+# ── SOS column aliases ────────────────────────────────────────────────────────
+# Maps canonical name → list of possible names found in different SFA exports.
+# Lower-cased for matching; original header case is preserved in the file.
+_SOS_COL_ALIASES: dict[str, list[str]] = {
+    "DATE CREATED":   ["date created", "date_created", "visit date", "visitdate",
+                       "created date", "created_date", "date", "survey date",
+                       "date reported", "date_reported", "submission date"],
+    "CUSTOMER NAME":  ["customer name", "customer_name", "outlet name", "outlet",
+                       "account name", "store name", "store", "shop name",
+                       "customername", "client name", "outlet_name"],
+    "PRODUCT_NAME":   ["product_name", "product name", "sku name", "sku",
+                       "brand name", "brand", "item name", "item"],
+    "PRODUCT_CATEGORY": ["product category", "product_category", "category",
+                          "product cat", "prod category", "item category", "cat"],
+    "FACINGS SOS%":   ["facings sos%", "facings sos", "sos%", "sos %", "sos",
+                       "share of shelf", "share of shelf %", "facings%",
+                       "facing sos%", "facing sos", "facing%"],
+    "POSITION":       ["position", "shelf position", "shelf_position",
+                       "pos", "shelf pos", "shelving position"],
+    "COUNTRY":        ["country", "country name", "country_name", "nation"],
+    "REGION":         ["region", "territory", "area", "district"],
+}
+
+def _resolve_sos_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename columns in the SOS dataframe to canonical names.
+    Works case-insensitively and handles common export variants.
+    Raises a clear ValueError listing available columns if a required
+    column cannot be matched.
+    """
+    col_lower = {c.lower().strip(): c for c in df.columns}
+    renames = {}
+    missing = []
+
+    for canonical, aliases in _SOS_COL_ALIASES.items():
+        # Already present under canonical name — nothing to do
+        if canonical in df.columns:
+            continue
+        # Try aliases in priority order
+        matched = None
+        for alias in aliases:
+            if alias in col_lower:
+                matched = col_lower[alias]
+                break
+        if matched:
+            if matched != canonical:
+                renames[matched] = canonical
+        else:
+            # POSITION, FACINGS SOS%, COUNTRY, REGION, and PRODUCT_CATEGORY are non-fatal — we can continue without them
+            if canonical not in ("POSITION", "FACINGS SOS%", "COUNTRY", "REGION", "PRODUCT_CATEGORY"):
+                missing.append(canonical)
+
+    if missing:
+        available = ", ".join(f"'{c}'" for c in df.columns[:20])
+        raise ValueError(
+            f"Could not find required column(s): {', '.join(missing)}. "
+            f"Columns in your file: {available}"
+        )
+
+    if renames:
+        df = df.rename(columns=renames)
+
+    # Ensure optional columns exist as NaN if absent
+    for col in ("POSITION", "FACINGS SOS%", "PRODUCT CATEGORY"):
+        if col not in df.columns:
+            df[col] = np.nan
+
+    return df
+
+
+def process_sos(file_bytes: bytes, filename: str = "") -> pd.DataFrame:
+    """
+    Rebuilt — content-aware column detection.
+
+    Instead of trusting column headers (which vary across SFA exports), we scan
+    the actual cell VALUES to identify each column. Brands and categories are
+    hardcoded constants — nothing from outside those lists can appear in charts.
+
+    Steps:
+      1. Find BRAND column  — whichever column has the most Uganda brand matches
+      2. Find SOS%  column  — numeric column with 'sos/share/facing' in header, or heuristic
+      3. Find DATE  column  — parseable datetime column
+      4. Find CUSTOMER col  — column whose values map to known key accounts
+      5. Find CATEGORY col  — optional, by header keyword
+      6. Find POSITION col  — optional
+      7. Find REGION/COUNTRY — optional, for filter UI
+    """
+    df = read_large_excel(file_bytes, sheet_name=0)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # ── STEP 1: Find BRAND column by scanning cell values ────────────────────
+    _best_col, _best_score = None, 0
+    for col in df.columns:
+        try:
+            vals = df[col].dropna().astype(str).str.upper().str.strip()
+            score = int(vals.apply(is_ug_brand).sum())
+            if score > _best_score:
+                _best_score, _best_col = score, col
+        except Exception:
+            continue
+
+    if _best_col is None or _best_score == 0:
+        raise ValueError(
+            "No Uganda brands found (Fay, Cosy, Sifa, Tishu Poa, Ultra). "
+            "Please upload the correct SOS .xlsx file."
+        )
+
+    df = df.rename(columns={_best_col: 'PRODUCT_NAME'})
+    df['PRODUCT_NAME'] = df['PRODUCT_NAME'].astype(str).str.strip()
+    # HARD FILTER — only Uganda brands, no exceptions
+    df = df[df['PRODUCT_NAME'].apply(is_ug_brand)].copy()
+    if df.empty:
+        raise ValueError("No Uganda brand rows found after filtering.")
+    # Normalise aliases (e.g. "Tishu" → "Tishu Poa")
+    df['PRODUCT_NAME'] = df['PRODUCT_NAME'].apply(
+        lambda x: UG_BRAND_ALIASES.get(x.upper().strip(), x.strip())
+    )
+
+    # ── STEP 2: Find SOS% column ─────────────────────────────────────────────
+    _SOS_KW = ['sos', 'share', 'facing', 'shelf']
+    _sos_col_found = False
+    # Try header keyword first
+    for col in df.columns:
+        if col == 'PRODUCT_NAME': continue
+        if any(kw in col.lower() for kw in _SOS_KW):
+            cleaned = pd.to_numeric(df[col].astype(str).str.strip().str.rstrip('%'), errors='coerce')
+            if cleaned.notna().sum() > 0:
+                df['FACINGS SOS%'] = cleaned
+                _sos_col_found = True
+                break
+    # Fallback: first numeric col whose values look like percentages
+    if not _sos_col_found:
+        for col in df.columns:
+            if col in ('PRODUCT_NAME', 'FACINGS SOS%'): continue
+            cleaned = pd.to_numeric(df[col].astype(str).str.strip().str.rstrip('%'), errors='coerce')
+            valid = cleaned.dropna()
+            if len(valid) > 0 and valid.between(0, 100).mean() > 0.7:
+                df['FACINGS SOS%'] = cleaned
+                break
+    if 'FACINGS SOS%' not in df.columns:
+        df['FACINGS SOS%'] = np.nan
+    # Normalise 0–1 fractions to 0–100
+    frac = df['FACINGS SOS%'].notna() & (df['FACINGS SOS%'] > 0) & (df['FACINGS SOS%'] <= 1)
+    df.loc[frac, 'FACINGS SOS%'] = df.loc[frac, 'FACINGS SOS%'] * 100
+    df = df[df['FACINGS SOS%'].notna()].copy()
+
+    # ── STEP 3: Find DATE column ─────────────────────────────────────────────
+    # Use smart date parsing: ISO format (YYYY-MM-DD...) must use dayfirst=False
+    # to avoid swapping month/day (e.g. 2026-06-04 wrongly parsed as April).
+    def _smart_parse_dates(series):
+        sample = series.dropna().astype(str).head(20)
+        # ISO format starts with 4-digit year
+        is_iso = sample.str.match(r'^\d{4}[-/]\d').any()
+        return pd.to_datetime(series, errors='coerce', dayfirst=not is_iso)
+
+    _DATE_KW = ['date', 'created', 'visit', 'survey', 'submission', 'reported']
+    _date_found = False
+    for col in df.columns:
+        if col in ('PRODUCT_NAME', 'FACINGS SOS%'): continue
+        if any(kw in col.lower() for kw in _DATE_KW):
+            parsed = _smart_parse_dates(df[col])
+            if parsed.notna().sum() > len(df) * 0.3:
+                df['DATE_PARSED'] = parsed
+                _date_found = True
+                break
+    if not _date_found:
+        for col in df.columns:
+            if col in ('PRODUCT_NAME', 'FACINGS SOS%', 'DATE_PARSED'): continue
+            parsed = _smart_parse_dates(df[col])
+            if parsed.notna().sum() > len(df) * 0.3:
+                df['DATE_PARSED'] = parsed
+                break
+    if 'DATE_PARSED' not in df.columns:
+        df['DATE_PARSED'] = pd.NaT
     df = df[df['DATE_PARSED'].notna()].copy()
     df['MONTH']     = df['DATE_PARSED'].dt.strftime('%B')
     df['MONTH_NUM'] = df['DATE_PARSED'].dt.month
 
-    def get_account(name):
+    # ── STEP 4: Find CUSTOMER column and map to key accounts ─────────────────
+    def _get_account(name):
         if pd.isna(name): return None
         n = str(name).upper().strip()
         for label, kws in SOS_KEY_ACCOUNTS:
             if any(k in n for k in kws): return label
         return None
-    df['ACCOUNT'] = df['CUSTOMER NAME'].apply(get_account)
+
+    _CUST_KW = ['customer', 'outlet', 'store', 'shop', 'client']
+    _cust_found = False
+    for col in df.columns:
+        if col in ('PRODUCT_NAME', 'FACINGS SOS%', 'DATE_PARSED', 'MONTH', 'MONTH_NUM'): continue
+        if any(kw in col.lower() for kw in _CUST_KW):
+            accts = df[col].apply(_get_account)
+            if accts.notna().sum() > 0:
+                df['CUSTOMER NAME'] = df[col]
+                df['ACCOUNT'] = accts
+                _cust_found = True
+                break
+    # Fallback: scan all columns for account name matches
+    if not _cust_found:
+        for col in df.columns:
+            if col in ('PRODUCT_NAME', 'FACINGS SOS%', 'DATE_PARSED', 'MONTH', 'MONTH_NUM'): continue
+            try:
+                accts = df[col].apply(_get_account)
+                if accts.notna().sum() > len(df) * 0.05:
+                    df['CUSTOMER NAME'] = df[col]
+                    df['ACCOUNT'] = accts
+                    break
+            except Exception:
+                continue
+
+    if 'ACCOUNT' not in df.columns:
+        raise ValueError(
+            "Could not find an outlet/customer column matching Uganda key accounts "
+            "(Carrefour, Shopwise, Masters, Fraine, etc.)."
+        )
     df = df[df['ACCOUNT'].notna()].copy()
-    return df
+
+    # ── STEP 5: Find CATEGORY column (optional) ───────────────────────────────
+    _CAT_KW = ['category', 'cat']
+    for col in df.columns:
+        if col in ('PRODUCT_NAME', 'FACINGS SOS%', 'DATE_PARSED', 'MONTH',
+                   'MONTH_NUM', 'CUSTOMER NAME', 'ACCOUNT'): continue
+        if any(kw in col.lower() for kw in _CAT_KW):
+            df['PRODUCT_CATEGORY'] = (
+                df[col].astype(str).str.upper().str.strip()
+                .map(lambda c: UG_CATEGORY_CANONICAL.get(c, c))
+            )
+            break
+    if 'PRODUCT_CATEGORY' not in df.columns:
+        df['PRODUCT_CATEGORY'] = 'UNKNOWN'
+
+    # ── STEP 6: Find POSITION column (optional) ───────────────────────────────
+    for col in df.columns:
+        if 'position' in col.lower() or col.lower() in ('pos',):
+            df['POSITION'] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            break
+    if 'POSITION' not in df.columns:
+        df['POSITION'] = 0
+
+    # ── STEP 7: Find REGION / COUNTRY columns (optional) ─────────────────────
+    for col in df.columns:
+        if 'region' in col.lower() or 'territory' in col.lower():
+            if 'REGION' not in df.columns: df['REGION'] = df[col]
+    for col in df.columns:
+        if 'country' in col.lower():
+            if 'COUNTRY' not in df.columns: df['COUNTRY'] = df[col]
+
+    # ── STEP 8: Attach SOS target per row ────────────────────────────────────
+    df['SOS_TARGET'] = df['PRODUCT_CATEGORY'].apply(get_sos_target)
+
+    # ── Keep only the columns the analytics page needs ────────────────────────
+    keep = ['PRODUCT_NAME', 'FACINGS SOS%', 'POSITION', 'DATE_PARSED',
+            'MONTH', 'MONTH_NUM', 'CUSTOMER NAME', 'ACCOUNT',
+            'PRODUCT_CATEGORY', 'SOS_TARGET']
+    if 'REGION'  in df.columns: keep.append('REGION')
+    if 'COUNTRY' in df.columns: keep.append('COUNTRY')
+    return df[[c for c in keep if c in df.columns]].copy()
+
+def _build_sos_negotiated_excel(df: pd.DataFrame) -> bytes:
+    """
+    Build a formatted Excel report for the negotiated/planogram SOS format.
+    Structure:
+      - Summary sheet: Brand Group × Chain, FACING SOS% heatmap
+      - Category sheets: one per PRODUCT_CATEGORY showing all shops
+      - Region sheet: SOS by region
+    """
+    wb = openpyxl.Workbook()
+    first = True
+
+    brands    = sorted(df['PRODUCT_NAME'].dropna().unique())
+    accounts  = sorted(df['ACCOUNT'].dropna().unique())
+    cats      = sorted(df['PRODUCT_CATEGORY'].dropna().unique()) if 'PRODUCT_CATEGORY' in df.columns else []
+    regions   = sorted(df['REGION'].dropna().unique()) if 'REGION' in df.columns else []
+
+    def _sos_fill(val, target=20):
+        if val is None or (isinstance(val, float) and np.isnan(val)): return None
+        return GREEN_FILL if val >= target else (AMBER_FILL if val > 0 else RED_FILL)
+
+    def _write_hdr(ws, row, col, val, bold=True, fill=None, sz=10):
+        c = ws.cell(row, col, val)
+        c.font = Font(name='Calibri', bold=bold, size=sz, color='FFFFFF' if fill else '1F4E79')
+        if fill: c.fill = fill
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        c.border = _bdr()
+        return c
+
+    def _write_val(ws, row, col, val):
+        c = ws.cell(row, col, round(float(val), 1) if isinstance(val, (int, float)) and not np.isnan(val) else '')
+        fill = _sos_fill(val) if isinstance(val, (int, float)) and not np.isnan(val) else None
+        if fill: c.fill = fill
+        c.font = Font(name='Calibri', size=9)
+        c.alignment = Alignment(horizontal='center')
+        c.border = _bdr()
+        return c
+
+    # ── Sheet 1: Brand × Account summary ─────────────────────────────────────
+    ws1 = wb.active; ws1.title = 'SOS Summary'
+    ws1.freeze_panes = 'B2'
+    _write_hdr(ws1, 1, 1, 'BRAND GROUP', fill=HDR_BLUE, sz=11)
+    ws1.column_dimensions['A'].width = 28
+    for ci, acct in enumerate(accounts, 2):
+        _write_hdr(ws1, 1, ci, acct, fill=HDR_MED, sz=9)
+        ws1.column_dimensions[get_column_letter(ci)].width = 14
+
+    for ri, brand in enumerate(brands, 2):
+        ws1.cell(ri, 1, brand).font = Font(name='Calibri', bold=True, size=9)
+        ws1.cell(ri, 1).border = _bdr()
+        for ci, acct in enumerate(accounts, 2):
+            sub = df[(df['PRODUCT_NAME'] == brand) & (df['ACCOUNT'] == acct)]
+            val = sub['FACINGS SOS%'].mean() if not sub.empty else np.nan
+            _write_val(ws1, ri, ci, val)
+        ws1.row_dimensions[ri].height = 14
+
+    # ── Sheet 2: Category × Account ──────────────────────────────────────────
+    ws2 = wb.create_sheet('SOS by Category')
+    ws2.freeze_panes = 'B2'
+    _write_hdr(ws2, 1, 1, 'CATEGORY', fill=HDR_BLUE, sz=11)
+    ws2.column_dimensions['A'].width = 26
+    for ci, acct in enumerate(accounts, 2):
+        _write_hdr(ws2, 1, ci, acct, fill=HDR_MED, sz=9)
+        ws2.column_dimensions[get_column_letter(ci)].width = 14
+    for ri, cat in enumerate(cats, 2):
+        ws2.cell(ri, 1, cat).font = Font(name='Calibri', bold=True, size=9)
+        ws2.cell(ri, 1).border = _bdr()
+        for ci, acct in enumerate(accounts, 2):
+            sub = df[(df['PRODUCT_CATEGORY'] == cat) & (df['ACCOUNT'] == acct)] if 'PRODUCT_CATEGORY' in df.columns else pd.DataFrame()
+            val = sub['FACINGS SOS%'].mean() if not sub.empty else np.nan
+            _write_val(ws2, ri, ci, val)
+        ws2.row_dimensions[ri].height = 14
+
+    # ── Sheet 3: Shop-level detail ────────────────────────────────────────────
+    ws3 = wb.create_sheet('Shop Detail')
+    shops = sorted(df['CUSTOMER NAME'].dropna().unique()) if 'CUSTOMER NAME' in df.columns else []
+    ws3.freeze_panes = 'B2'
+    _write_hdr(ws3, 1, 1, 'BRAND GROUP', fill=HDR_BLUE, sz=11)
+    ws3.column_dimensions['A'].width = 28
+    for ci, shop in enumerate(shops, 2):
+        _write_hdr(ws3, 1, ci, shop, fill=HDR_MED, sz=9)
+        ws3.column_dimensions[get_column_letter(ci)].width = 16
+    for ri, brand in enumerate(brands, 2):
+        ws3.cell(ri, 1, brand).font = Font(name='Calibri', bold=True, size=9)
+        ws3.cell(ri, 1).border = _bdr()
+        for ci, shop in enumerate(shops, 2):
+            sub = df[(df['PRODUCT_NAME'] == brand) & (df['CUSTOMER NAME'] == shop)] if 'CUSTOMER NAME' in df.columns else pd.DataFrame()
+            val = sub['FACINGS SOS%'].mean() if not sub.empty else np.nan
+            _write_val(ws3, ri, ci, val)
+        ws3.row_dimensions[ri].height = 14
+
+    # ── Sheet 4: Region summary ───────────────────────────────────────────────
+    if regions:
+        ws4 = wb.create_sheet('SOS by Region')
+        ws4.freeze_panes = 'B2'
+        _write_hdr(ws4, 1, 1, 'BRAND GROUP', fill=HDR_BLUE, sz=11)
+        ws4.column_dimensions['A'].width = 28
+        for ci, reg in enumerate(regions, 2):
+            _write_hdr(ws4, 1, ci, reg, fill=HDR_MED, sz=9)
+            ws4.column_dimensions[get_column_letter(ci)].width = 16
+        for ri, brand in enumerate(brands, 2):
+            ws4.cell(ri, 1, brand).font = Font(name='Calibri', bold=True, size=9)
+            ws4.cell(ri, 1).border = _bdr()
+            for ci, reg in enumerate(regions, 2):
+                sub = df[(df['PRODUCT_NAME'] == brand) & (df['REGION'] == reg)] if 'REGION' in df.columns else pd.DataFrame()
+                val = sub['FACINGS SOS%'].mean() if not sub.empty else np.nan
+                _write_val(ws4, ri, ci, val)
+            ws4.row_dimensions[ri].height = 14
+
+    # ── Legend ────────────────────────────────────────────────────────────────
+    wl = wb.create_sheet('Legend')
+    wl.merge_cells('A1:C1')
+    wl['A1'] = 'SOS NEGOTIATED REPORT — LEGEND'
+    wl['A1'].font = Font(name='Calibri', bold=True, size=13, color='FFFFFF')
+    wl['A1'].fill = HDR_BLUE; wl['A1'].alignment = Alignment(horizontal='center')
+    for ri, (k, v) in enumerate([
+        ('',''), ('COLOR CODING',''),
+        ('Green  ≥ 20%', 'Strong share of shelf'),
+        ('Amber  > 0%',  'Present but below target'),
+        ('Red = 0%',     'Not present / zero facing'),
+        ('',''), ('SHEETS',''),
+        ('SOS Summary',    'Mean FACING SOS% per Brand Group × Chain'),
+        ('SOS by Category','Mean FACING SOS% per Category × Chain'),
+        ('Shop Detail',    'FACING SOS% per Brand Group × individual outlet'),
+        ('SOS by Region',  'Mean FACING SOS% per Brand Group × Region'),
+    ], 3):
+        wl[f'A{ri}'] = k; wl[f'B{ri}'] = v
+        wl[f'A{ri}'].font = Font(name='Calibri', bold=any(x in k for x in ('COLOR','SHEETS')), size=10)
+        wl[f'B{ri}'].font = Font(name='Calibri', size=10)
+    wl.column_dimensions['A'].width = 28; wl.column_dimensions['B'].width = 60
+
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    return buf.getvalue()
 
 
 def build_sos_excel(df: pd.DataFrame) -> bytes:
-    """Build the formatted SOS Excel workbook from a processed DataFrame."""
+    """Build the formatted SOS Excel workbook from a processed DataFrame.
+    Handles both survey format (has real months) and negotiated/snapshot format.
+    """
+    is_negotiated = df['MONTH'].eq('Snapshot').all() if 'MONTH' in df.columns else False
+    if is_negotiated:
+        return _build_sos_negotiated_excel(df)
+
     months_ordered = (df[['MONTH','MONTH_NUM']].drop_duplicates()
                       .sort_values('MONTH_NUM')['MONTH'].tolist())
     brands = sorted(df['PRODUCT_NAME'].dropna().unique())
     accounts_with_data = [a for a,_ in SOS_KEY_ACCOUNTS if a in df['ACCOUNT'].values]
+
+    # Build brand → SOS target lookup using category targets
+    brand_sos_target = {}
+    if 'SOS_TARGET' in df.columns and 'PRODUCT_CATEGORY' in df.columns:
+        for brand in brands:
+            sub = df[df['PRODUCT_NAME'] == brand]
+            if not sub.empty and 'SOS_TARGET' in sub.columns:
+                brand_sos_target[brand] = int(sub['SOS_TARGET'].mode()[0])
+    # fallback
+    for b in brands:
+        brand_sos_target.setdefault(b, SOS_GREEN_THR)
 
     def block_data(account):
         sub = df[df['ACCOUNT']==account]
@@ -879,7 +1644,7 @@ def build_sos_excel(df: pd.DataFrame) -> bytes:
                 c2=ws.cell(dr,sc+1+mi)
                 if pd.isna(sv): c2.value='-'; c2.font=Font(name='Calibri',size=9,color='BFBFBF'); c2.fill=alt
                 else:
-                    c2.value=sv/100; c2.number_format='0%'; c2.fill=_sos_fill_xl(sv); c2.font=Font(name='Calibri',size=9)
+                    c2.value=sv/100; c2.number_format='0%'; c2.fill=_sos_fill_xl(sv, brand_sos_target.get(brand, SOS_GREEN_THR)); c2.font=Font(name='Calibri',size=9)
                 c2.alignment=Alignment(horizontal='center',vertical='center'); c2.border=_sos_bdr()
                 if not pd.isna(pv): pvs.append(pv)
             ap=round(np.mean(pvs),1) if pvs else np.nan
@@ -940,3 +1705,273 @@ def build_sos_excel(df: pd.DataFrame) -> bytes:
     wl.column_dimensions['A'].width=28; wl.column_dimensions['B'].width=82
     buf=io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MHSKU PERSISTENT REFERENCE  (file-backed JSON store)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import json, os, pathlib, tempfile
+
+_MHSKU_STORE = pathlib.Path(tempfile.gettempdir()) / "ug_mhsku_store.json"
+
+
+def _load_store() -> dict:
+    if _MHSKU_STORE.exists():
+        try:
+            return json.loads(_MHSKU_STORE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_store(data: dict):
+    _MHSKU_STORE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def mhsku_save(records: list[dict], uploaded_by: str = ""):
+    """
+    Persist a list of MHSKU records.
+    Each record: {code, sku, category, pressure_target}
+    Merges on code — new upload wins for matching codes.
+    """
+    store = _load_store()
+    existing = {r["code"]: r for r in store.get("records", [])}
+    for r in records:
+        existing[r["code"]] = r
+    store["records"] = list(existing.values())
+    store["last_updated"] = datetime.utcnow().isoformat() + "Z"
+    store["last_updated_by"] = uploaded_by
+    _save_store(store)
+
+
+def mhsku_load() -> tuple[list[dict], str, str]:
+    """Returns (records, last_updated, last_updated_by)."""
+    store = _load_store()
+    return (
+        store.get("records", []),
+        store.get("last_updated", ""),
+        store.get("last_updated_by", ""),
+    )
+
+
+def mhsku_clear():
+    """Wipe the entire MHSKU store. Admin only — caller must gate access."""
+    _save_store({})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  UPLOADED DATA PERSISTENCE  (file-backed parquet store)
+#  Stores the last-uploaded OSA and SOS DataFrames so the app remembers data
+#  across page navigations and browser refreshes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DATA_STORE_DIR = pathlib.Path(tempfile.gettempdir()) / "ug_analytics_store"
+_DATA_STORE_DIR.mkdir(exist_ok=True)
+
+_OSA_STORE_PATH  = _DATA_STORE_DIR / "osa_data.pkl"
+_SOS_STORE_PATH  = _DATA_STORE_DIR / "sos_data.pkl"
+_OSA_META_PATH   = _DATA_STORE_DIR / "osa_meta.json"
+_SOS_META_PATH   = _DATA_STORE_DIR / "sos_meta.json"
+
+
+def _save_df(df: pd.DataFrame, path: pathlib.Path, meta: dict, meta_path: pathlib.Path):
+    import pickle
+    try:
+        with open(str(path), 'wb') as _f:
+            pickle.dump(df, _f, protocol=4)
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, default=str))
+    except Exception:
+        pass
+
+
+def _load_df(path: pathlib.Path, meta_path: pathlib.Path):
+    """Returns (df, meta) or (None, {})."""
+    import pickle
+    if not path.exists():
+        return None, {}
+    try:
+        with open(str(path), 'rb') as _f:
+            df = pickle.load(_f)
+        meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        return df, meta
+    except Exception:
+        return None, {}
+
+
+def osa_data_save(df: pd.DataFrame, filename: str = "", uploaded_by: str = ""):
+    from datetime import datetime as _dt
+    meta = {"filename": filename, "uploaded_by": uploaded_by,
+            "saved_at": _dt.now().isoformat(), "rows": len(df)}
+    _save_df(df, _OSA_STORE_PATH, meta, _OSA_META_PATH)
+
+
+def osa_data_load():
+    """Returns (df, meta) — df is None if no data stored."""
+    return _load_df(_OSA_STORE_PATH, _OSA_META_PATH)
+
+
+def osa_data_clear():
+    for p in (_OSA_STORE_PATH, _OSA_META_PATH):
+        if p.exists(): p.unlink()
+
+
+def sos_data_save(df: pd.DataFrame, filename: str = "", uploaded_by: str = ""):
+    from datetime import datetime as _dt
+    meta = {"filename": filename, "uploaded_by": uploaded_by,
+            "saved_at": _dt.now().isoformat(), "rows": len(df)}
+    _save_df(df, _SOS_STORE_PATH, meta, _SOS_META_PATH)
+
+
+def sos_data_load():
+    """Returns (df, meta) — df is None if no data stored."""
+    return _load_df(_SOS_STORE_PATH, _SOS_META_PATH)
+
+
+def sos_data_clear():
+    for p in (_SOS_STORE_PATH, _SOS_META_PATH):
+        if p.exists(): p.unlink()
+
+
+def parse_mhsku_file(file_bytes: bytes) -> list[dict]:
+    """
+    Parse a MHSKU reference .xlsx file.
+    Expects columns: Code | SKU | CATEGORIZED | PRESSURE TARGET
+    Returns list of dicts: {code, sku, category, pressure_target}
+    """
+    import re as _re
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    # Prefer 'MHSKU' sheet, fall back to first sheet
+    ws = wb["MHSKU"] if "MHSKU" in wb.sheetnames else wb.active
+    records = []
+    for row in ws.iter_rows(values_only=True):
+        code, sku, cat, pt = (row[i] if len(row) > i else None for i in range(4))
+        if not sku:
+            continue
+        sku_str = str(sku).strip()
+        if sku_str.lower() in ("sku", ""):
+            continue
+        code_str = str(code).strip() if code else ""
+        cat_str  = str(cat).strip()  if cat  else "MHSKU"
+        nums = _re.findall(r"\d+", str(pt).strip()) if pt else []
+        pt_val = int(nums[0]) if nums else 6
+        records.append({"code": code_str, "sku": sku_str, "category": cat_str, "pressure_target": pt_val})
+    return records
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LARGE-FILE OPTIMISED LOADERS  (handles up to ~300 MB)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Always stream — no size threshold needed. Streaming is always safer on cloud.
+
+def _optimise_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Downcast numeric columns and convert low-cardinality object columns to
+    category dtype.  Typically cuts RAM by 50-70% on wide survey exports.
+    """
+    for col in df.columns:
+        col_dtype = df[col].dtype
+        if col_dtype == object:
+            n_unique = df[col].nunique(dropna=False)
+            if n_unique / max(len(df), 1) < 0.5:
+                try:
+                    df[col] = df[col].astype('category')
+                except Exception:
+                    pass
+        elif col_dtype == np.float64:
+            try: df[col] = df[col].astype(np.float32)
+            except Exception: pass
+        elif col_dtype == np.int64:
+            try: df[col] = df[col].astype(np.int32)
+            except Exception: pass
+    return df
+
+
+def read_large_csv(file_bytes: bytes, chunksize: int = 50_000) -> pd.DataFrame:
+    """Read a CSV in chunks to avoid peak-RAM spikes on large files."""
+    chunks = []
+    for chunk in pd.read_csv(
+        io.BytesIO(file_bytes), chunksize=chunksize,
+        low_memory=True, encoding_errors="replace"
+    ):
+        chunks.append(_optimise_dtypes(chunk))
+    return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+
+
+def _bytes_to_tempfile(file_bytes: bytes, suffix: str = ".xlsx") -> str:
+    """Write bytes to a named temp file and return its path.
+
+    Using a real file path avoids keeping a second io.BytesIO copy of the
+    data in RAM while openpyxl streams through it.
+    """
+    import tempfile as _tf
+    fd, path = _tf.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(file_bytes)
+    except Exception:
+        os.close(fd)
+        raise
+    return path
+
+
+def read_large_excel(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
+    """
+    Stream-read an Excel file using openpyxl read_only mode.
+
+    Key RAM savings vs naïve pd.read_excel():
+    • Writes bytes to a temp file so openpyxl reads from disk, not a
+      second in-memory BytesIO buffer.
+    • Yields rows through a generator into pd.DataFrame() — never builds
+      a full Python list of all rows before constructing the frame.
+    • Calls wb.close() immediately after the header pass to release the
+      workbook object before row iteration.
+
+    This is safe up to ~300 MB on Streamlit Cloud's 1 GB RAM limit.
+    """
+    tmp = _bytes_to_tempfile(file_bytes, suffix=".xlsx")
+    try:
+        wb = openpyxl.load_workbook(tmp, read_only=True, data_only=True)
+        # Resolve sheet
+        if isinstance(sheet_name, str):
+            ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.active
+        else:
+            ws = wb.worksheets[sheet_name] if isinstance(sheet_name, int) else wb.active
+
+        row_iter = ws.iter_rows(values_only=True)
+        header = next(row_iter, None)
+        if header is None:
+            wb.close()
+            return pd.DataFrame()
+
+        # Stream rows in chunks to avoid building a full Python list in RAM
+        CHUNK = 50_000
+        chunks = []
+        while True:
+            batch = list(itertools.islice(row_iter, CHUNK))
+            if not batch:
+                break
+            chunks.append(_optimise_dtypes(pd.DataFrame(batch, columns=header)))
+        wb.close()
+        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=header)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def smart_load(file_bytes: bytes, filename: str, sheet_name=0) -> pd.DataFrame:
+    """
+    Auto-detect format and load efficiently — handles CSV, XLS, XLSX up to 300 MB.
+    For Excel files it first tries the named sheet ('OSA' or 'SOS'), then falls back.
+    """
+    fname = filename.lower()
+    if fname.endswith(".csv"):
+        return read_large_csv(file_bytes)
+    try:
+        return read_large_excel(file_bytes, sheet_name=sheet_name)
+    except Exception:
+        # Final fallback — treat as CSV (some SFA exports have wrong extension)
+        return read_large_csv(file_bytes)
