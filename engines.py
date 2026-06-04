@@ -660,23 +660,39 @@ def process_osa(file_bytes: bytes, filename: str = "",
         'wakiso', 'mukono', 'lira', 'mbale', 'arua', 'masaka',
     ]
     if 'BRAND NAME' in df.columns:
-        df = df[df['BRAND NAME'].apply(is_ug_osa_brand)].copy()
+        df = df[df['BRAND NAME'].astype(str).apply(is_ug_osa_brand)].copy()
 
     # Filter Uganda outlets (drop Kenya / other-country rows early)
     if 'COUNTRY' in df.columns:
-        mask_ug = df['COUNTRY'].str.strip().str.lower().isin(['uganda', 'ug'])
+        mask_ug = df['COUNTRY'].astype(str).str.strip().str.lower().isin(['uganda', 'ug'])
         df = df[mask_ug].copy()
     elif 'REGION' in df.columns:
-        mask_ug = df['REGION'].str.strip().str.lower().apply(
-            lambda r: any(kw in r for kw in _UG_REGION_KEYWORDS) if isinstance(r, str) else False
+        mask_ug = df['REGION'].astype(str).str.strip().str.lower().apply(
+            lambda r: any(kw in r for kw in _UG_REGION_KEYWORDS) if r not in ('nan','none','') else False
         )
         df = df[mask_ug].copy()
 
     # ── Parse dates ───────────────────────────────────────────────────────────
-    # Smart date parsing — ISO format (YYYY-MM-DD) must NOT use dayfirst
-    _osa_sample = df['DATE REPORTED'].dropna().astype(str).head(20)
-    _osa_iso = _osa_sample.str.match(r'^\d{4}[-/]\d').any()
-    df['DATE_PARSED'] = pd.to_datetime(df['DATE REPORTED'], errors='coerce', dayfirst=not _osa_iso)
+    # DATE REPORTED may be:
+    #   a) Excel serial number (float like 46172.49)  → convert via Excel epoch
+    #   b) ISO string "2026-05-30"                    → dayfirst=False
+    #   c) DMY string "30/05/2026"                    → dayfirst=True
+    _date_col = df['DATE REPORTED'].dropna()
+    _is_numeric = pd.to_numeric(_date_col, errors='coerce').notna().mean() > 0.8
+
+    if _is_numeric:
+        # Excel serial: days since 1899-12-30
+        _serials = pd.to_numeric(df['DATE REPORTED'], errors='coerce')
+        df['DATE_PARSED'] = pd.to_datetime(
+            _serials.apply(lambda x: pd.Timestamp('1899-12-30') + pd.Timedelta(days=x)
+                           if pd.notna(x) else pd.NaT)
+        )
+    else:
+        _sample = _date_col.astype(str).head(20)
+        _is_iso = _sample.str.match(r'^\d{4}[-/]\d').any()
+        df['DATE_PARSED'] = pd.to_datetime(df['DATE REPORTED'], errors='coerce',
+                                           dayfirst=not _is_iso)
+
     df = df[df['DATE_PARSED'].notna()].copy()
 
     # ── Derive Month if missing ───────────────────────────────────────────────
@@ -978,13 +994,14 @@ def _matches_ug_brand(n: str) -> bool:
 
 def is_ug_osa_brand(name: str) -> bool:
     """Return True if the OSA BRAND NAME belongs to a Uganda-tracked brand."""
-    if not name or not isinstance(name, str):
+    if not name or not isinstance(name, str) or name.lower() in ('nan', 'none', ''):
         return False
     return _matches_ug_brand(name.upper().strip())
 
 def is_ug_brand(name: str) -> bool:
     """Return True if the SOS PRODUCT_NAME belongs to a Uganda-tracked brand."""
-    if not name or not isinstance(name, str):
+    if not name or not isinstance(name, str) or name.lower() in ('nan', 'none', ''):
+        return False
         return False
     return _matches_ug_brand(name.upper().strip())
 
@@ -1156,7 +1173,7 @@ def process_sos_negotiated(file_bytes: bytes) -> pd.DataFrame:
         df.loc[frac_mask, 'FACINGS SOS%'] = df.loc[frac_mask, 'FACINGS SOS%'] * 100
 
     # ── Filter to Uganda brands only ──────────────────────────────────────────
-    ug_mask = df['PRODUCT_NAME'].apply(is_ug_brand)
+    ug_mask = df['PRODUCT_NAME'].astype(str).apply(is_ug_brand)
     df = df[ug_mask].copy()
 
     # ── Filter to Uganda outlets only ─────────────────────────────────────────
@@ -1165,11 +1182,11 @@ def process_sos_negotiated(file_bytes: bytes) -> pd.DataFrame:
         'wakiso', 'mukono', 'lira', 'mbale', 'arua', 'masaka',
     ]
     if 'COUNTRY' in df.columns:
-        mask_ug = df['COUNTRY'].str.strip().str.lower().isin(['uganda', 'ug'])
+        mask_ug = df['COUNTRY'].astype(str).str.strip().str.lower().isin(['uganda', 'ug'])
         df = df[mask_ug].copy()
     elif 'REGION' in df.columns:
-        mask_ug = df['REGION'].str.strip().str.lower().apply(
-            lambda r: any(kw in r for kw in _UG_REGION_KEYWORDS) if isinstance(r, str) else False
+        mask_ug = df['REGION'].astype(str).str.strip().str.lower().apply(
+            lambda r: any(kw in r for kw in _UG_REGION_KEYWORDS) if r not in ('nan','none','') else False
         )
         df = df[mask_ug].copy()
 
@@ -1298,7 +1315,7 @@ def process_sos(file_bytes: bytes, filename: str = "") -> pd.DataFrame:
     df = df.rename(columns={_best_col: 'PRODUCT_NAME'})
     df['PRODUCT_NAME'] = df['PRODUCT_NAME'].astype(str).str.strip()
     # HARD FILTER — only Uganda brands, no exceptions
-    df = df[df['PRODUCT_NAME'].apply(is_ug_brand)].copy()
+    df = df[df['PRODUCT_NAME'].astype(str).apply(is_ug_brand)].copy()
     if df.empty:
         raise ValueError("No Uganda brand rows found after filtering.")
     # Normalise aliases (e.g. "Tishu" → "Tishu Poa")
