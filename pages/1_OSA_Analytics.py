@@ -10,6 +10,7 @@ from engines import (
     GLOBAL_CSS, get_theme, get_plotly_layout, osa_color,
     process_osa, load_pressure_targets, mhsku_load,
     UG_FOCUS_CATEGORIES, inject_sidebar_toggle, inject_theme_toggle,
+    UG_EXCLUDED_CATEGORIES,
     osa_data_save, osa_data_load, osa_data_clear,
 )
 from auth import require_login, logout
@@ -113,6 +114,10 @@ elif saved_df is not None and use_saved:
 else:
     st.markdown('<div class="result-box info">⬆️  Upload your OSA data file to continue, or enable saved data above.</div>', unsafe_allow_html=True)
     st.stop()
+
+if 'PRODUCT CATEGORY' in df.columns:
+    df = df[~df['PRODUCT CATEGORY'].astype(str).str.upper().str.strip()
+            .isin(UG_EXCLUDED_CATEGORIES)].copy()
 
 if pt_file and uploaded is not None:
     from engines import load_pressure_targets as _lpt
@@ -347,7 +352,15 @@ with h3b:
                    .pivot(index='ACCOUNT', columns='PRODUCT CATEGORY', values='OSA'))
     st.plotly_chart(_heatmap(heat_cat, "Account × Category OSA (%)"), use_container_width=True)
 
+# ── Row 3b: Category × Brand heatmap (both dimensions at once) ──────────────
+st.markdown('<div class="sec-label">Category × Brand Heatmap</div>', unsafe_allow_html=True)
+heat_cat_brand = (dff.groupby(['PRODUCT CATEGORY','BRAND NAME'])['OSA']
+                      .mean().round(1).reset_index()
+                      .pivot(index='PRODUCT CATEGORY', columns='BRAND NAME', values='OSA'))
+st.plotly_chart(_heatmap(heat_cat_brand, "Category × Brand OSA (%)"), use_container_width=True)
+
 # ── Row 4: Distribution + Month comparison ───────────────────────────────────
+
 st.markdown("---")
 r4c1, r4c2 = st.columns(2)
 
@@ -419,5 +432,108 @@ with ra2:
     apply_layout(fig8, "⚠️ Bottom 10 Accounts", height=340)
     fig8.update_xaxes(range=[0, 115], ticksuffix='%')
     st.plotly_chart(fig8, use_container_width=True)
+
+# ── Row 6: SKU-wise OSA ───────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown('<div class="sec-label">OSA% by SKU</div>', unsafe_allow_html=True)
+
+has_code = 'PRODUCT CODE' in dff.columns
+has_desc = 'DESCRIPTION' in dff.columns
+sku_group_cols = [c for c in ['PRODUCT CODE', 'DESCRIPTION'] if c in dff.columns]
+
+if not sku_group_cols:
+    st.info("No SKU / description column found in this file.")
+else:
+    sku_ctrl1, sku_ctrl2 = st.columns([2, 1])
+    with sku_ctrl1:
+        sku_search = st.text_input("🔎 Search SKU (code or description)", value="", key="osa_sku_search",
+                                    placeholder="Type part of a code or description to filter…")
+    with sku_ctrl2:
+        sku_n = st.number_input("Show top/bottom N", min_value=5, max_value=100,
+                                 value=20, step=5, key="osa_sku_n")
+
+    sku_osa = (dff.groupby(sku_group_cols)
+                  .agg(OSA=('OSA', 'mean'), Records=('OSA', 'size'))
+                  .reset_index())
+    sku_osa['OSA'] = sku_osa['OSA'].round(1)
+
+    if has_code and has_desc:
+        sku_osa['SKU'] = (sku_osa['PRODUCT CODE'].astype(str).str.strip()
+                           + ' — ' + sku_osa['DESCRIPTION'].astype(str).str.strip())
+        sku_osa = sku_osa.rename(columns={'PRODUCT CODE': 'Code', 'DESCRIPTION': 'Description'})
+        sku_osa = sku_osa[['SKU', 'Code', 'Description', 'OSA', 'Records']]
+    else:
+        sku_osa = sku_osa.rename(columns={sku_group_cols[0]: 'SKU'})
+
+    sku_col = 'SKU'  # display/search/groupby key used below
+
+    if sku_search:
+        search_mask = sku_osa['SKU'].str.contains(sku_search, case=False, na=False)
+        if has_code and has_desc:
+            search_mask = search_mask | sku_osa['Code'].str.contains(sku_search, case=False, na=False)
+        sku_osa = sku_osa[search_mask]
+
+    if sku_osa.empty:
+        st.warning("No SKUs match that search.")
+    else:
+        sku_osa = sku_osa.sort_values('OSA', ascending=False)
+
+        sk1, sk2 = st.columns(2)
+        with sk1:
+            top_sku = sku_osa.head(int(sku_n)).sort_values('OSA')
+            fig_sku_top = go.Figure(go.Bar(
+                x=top_sku['OSA'], y=top_sku['SKU'], orientation='h',
+                marker_color=[th['green']] * len(top_sku),
+                text=top_sku['OSA'].map(lambda v: f"{v:.1f}%"),
+                textposition='outside', textfont=dict(size=9, color=th['text']),
+            ))
+            apply_layout(fig_sku_top, f"🏆 Top {len(top_sku)} SKUs by OSA%",
+                         height=max(340, len(top_sku) * 24))
+            fig_sku_top.update_xaxes(range=[0, 115], ticksuffix='%')
+            fig_sku_top.update_yaxes(tickfont=dict(size=9))
+            st.plotly_chart(fig_sku_top, use_container_width=True)
+
+        with sk2:
+            bottom_sku = sku_osa.tail(int(sku_n)).sort_values('OSA')
+            fig_sku_bot = go.Figure(go.Bar(
+                x=bottom_sku['OSA'], y=bottom_sku['SKU'], orientation='h',
+                marker_color=color_bars(bottom_sku['OSA']),
+                text=bottom_sku['OSA'].map(lambda v: f"{v:.1f}%"),
+                textposition='outside', textfont=dict(size=9, color=th['text']),
+            ))
+            apply_layout(fig_sku_bot, f"⚠️ Bottom {len(bottom_sku)} SKUs by OSA%",
+                         height=max(340, len(bottom_sku) * 24))
+            fig_sku_bot.update_xaxes(range=[0, 115], ticksuffix='%')
+            fig_sku_bot.update_yaxes(tickfont=dict(size=9))
+            st.plotly_chart(fig_sku_bot, use_container_width=True)
+
+        with st.expander(f"📋 Full SKU table ({len(sku_osa):,} SKUs)"):
+            st.dataframe(
+                sku_osa.rename(columns={'OSA': 'OSA %'}),
+                use_container_width=True, hide_index=True,
+            )
+
+        # ── Account × SKU heatmap ────────────────────────────────────────────
+        st.markdown('<div class="sec-label" style="margin-top:16px">Account × SKU Heatmap</div>',
+                    unsafe_allow_html=True)
+        default_skus = list(pd.concat([sku_osa.head(10), sku_osa.tail(10)])['SKU'].unique())
+        heat_skus = st.multiselect(
+            "SKUs to show in heatmap (defaults to current top/bottom 10)",
+            options=list(sku_osa['SKU']), default=default_skus, key="osa_sku_heat_pick",
+        )
+        if heat_skus:
+            if has_code and has_desc:
+                heat_base = dff.copy()
+                heat_base['SKU'] = (heat_base['PRODUCT CODE'].astype(str).str.strip()
+                                     + ' — ' + heat_base['DESCRIPTION'].astype(str).str.strip())
+            else:
+                heat_base = dff.rename(columns={sku_group_cols[0]: 'SKU'})
+            heat_sku_df = heat_base[heat_base['SKU'].isin(heat_skus)]
+            heat_sku = (heat_sku_df.groupby(['ACCOUNT', 'SKU'])['OSA']
+                           .mean().round(1).reset_index()
+                           .pivot(index='ACCOUNT', columns='SKU', values='OSA'))
+            st.plotly_chart(_heatmap(heat_sku, "Account × SKU OSA (%)"), use_container_width=True)
+        else:
+            st.info("Pick at least one SKU above to render the heatmap.")
 
 st.markdown('<div class="footer">OSA Analytics — Uganda Field Data</div>', unsafe_allow_html=True)

@@ -635,6 +635,9 @@ def process_osa(file_bytes: bytes, filename: str = "",
         "BRAND NAME":      ["brand name", "brand_name", "brand", "product brand"],
         "PRODUCT CATEGORY":["product category", "product_category", "category", "cat"],
         "PRODUCT CODE":    ["product code", "product_code", "sku code", "item code", "code"],
+        "DESCRIPTION":     ["description", "product description", "product_description",
+                             "product name", "product_name", "sku name", "sku_name",
+                             "item description", "item name", "item_name", "sku description"],
         "PRESSURE TARGET": ["pressure target", "pressure_target", "target", "pt"],
         "QUANTITY":        ["quantity", "qty", "stock qty", "count"],
         "STOCK LEVEL":     ["stock level", "stock_level", "availability", "available"],
@@ -749,12 +752,16 @@ def process_osa(file_bytes: bytes, filename: str = "",
         df['PRODUCT CATEGORY'] = (df['PRODUCT CATEGORY']
                                    .str.upper().str.strip()
                                    .map(lambda c: UG_CATEGORY_CANONICAL.get(c, c)))
+        df = df[~df['PRODUCT CATEGORY'].isin(UG_EXCLUDED_CATEGORIES)].copy()
 
     return df
 
 
 def build_osa_excel(df: pd.DataFrame) -> bytes:
     """Build the formatted OSA Excel workbook from a processed DataFrame."""
+    if 'PRODUCT CATEGORY' in df.columns:
+        df = df[~df['PRODUCT CATEGORY'].astype(str).str.upper().str.strip()
+                .isin(UG_EXCLUDED_CATEGORIES)].copy()
     def make_pivot(data, rows):
         wp = [w for w in OSA_WEEKS if w in data['WEEK_LABEL'].values]
         pt = data.pivot_table(index=rows, columns='WEEK_LABEL', values='OSA', aggfunc='mean')
@@ -808,18 +815,46 @@ def build_osa_excel(df: pd.DataFrame) -> bytes:
                 c.alignment = Alignment(horizontal='center', vertical='center'); c.border = _bdr()
             pf = fv
         for i in range(n_rc):
-            ws.column_dimensions[get_column_letter(i+1)].width = 28 if i==0 else 22
+            lbl = row_labels[i]
+            default_w = 40 if lbl == 'SKU' else (28 if i == 0 else 22)
+            ws.column_dimensions[get_column_letter(i+1)].width = default_w
         for i in range(len(all_cols)):
             ws.column_dimensions[get_column_letter(n_rc+i+1)].width = 10
 
     wb    = openpyxl.Workbook(); first = True
     months = sorted(df['Month'].dropna().unique(), key=lambda m: datetime.strptime(m,'%B').month)
+
+    # ── Build SKU label: pick a human-friendly description column when present,
+    #     falling back to product code. Detect common description column variants
+    #     so previously-saved frames (e.g. containing 'PRODUCT DESCRIPTION') are handled.
+    df = df.copy()
+    col_map = {c.upper().strip(): c for c in df.columns}
+    desc_candidates = [
+        'DESCRIPTION', 'PRODUCT DESCRIPTION', 'PRODUCT_DESCRIPTION',
+        'PRODUCT NAME', 'PRODUCT_NAME', 'SKU', 'SKU NAME', 'SKU_NAME',
+        'ITEM DESCRIPTION', 'ITEM_DESCRIPTION'
+    ]
+    desc_col = None
+    for cand in desc_candidates:
+        if cand in col_map:
+            desc_col = col_map[cand]
+            break
+    if desc_col:
+        df['SKU'] = df[desc_col].astype(str).str.strip()
+    elif 'PRODUCT CODE' in df.columns:
+        df['SKU'] = df['PRODUCT CODE'].astype(str).str.strip()
+
     configs = [
         ('Brand OSA',       ['BRAND NAME'],                 'OSA — BY BRAND'),
         ('Category OSA',    ['PRODUCT CATEGORY'],           'OSA — BY PRODUCT CATEGORY'),
         ('Account x Brand', ['ACCOUNT','BRAND NAME'],       'OSA — BY ACCOUNT & BRAND'),
         ('Account x Cat',   ['ACCOUNT','PRODUCT CATEGORY'], 'OSA — BY ACCOUNT & CATEGORY'),
     ]
+    if 'SKU' in df.columns:
+        configs += [
+            ('SKU OSA',       ['SKU'],            'OSA — BY SKU'),
+            ('Account x SKU', ['ACCOUNT','SKU'],  'OSA — BY ACCOUNT & SKU'),
+        ]
     ms = []
     for month in months:
         md = df[df['Month']==month]
@@ -845,7 +880,7 @@ def build_osa_excel(df: pd.DataFrame) -> bytes:
         ('Step 3',f'Listed items with Pressure Target=0 → default target set to {OSA_DEFAULT_PT}.'),
         ('Step 4','Quantity ≥ Pressure Target → 100%  |  Quantity < Pressure Target → 0%'),
         ('Step 5','Weeks numbered 1,2,3… in order within each month.'),
-        ('Step 6','Mean OSA score per Brand / Category / Account grouping.'),
+        ('Step 6','Mean OSA score per Brand / Category / SKU / Account grouping.'),
         ('',''),('DATA SUMMARY',''),
     ] + [(f'  {m}', s) for m, s in ms]
     for ri, (k, v) in enumerate(notes, 3):
@@ -965,6 +1000,7 @@ UG_CATEGORY_CANONICAL = {
     'ALLUMINIUM FOIL':        'ALUMINUM FOILS',
     'CLING FILM':             'CLING FILM',
     'FACIALS':                'FACIALS',
+    'FACIAL':                 'FACIALS',
     'MULTIFOLDS HAND TOWELS': 'MULTIFOLDS HAND TOWELS',
     'MULTIFOLD HAND TOWELS':  'MULTIFOLDS HAND TOWELS',
     'HAND TOWEL':             'MULTIFOLDS HAND TOWELS',
@@ -977,6 +1013,38 @@ UG_CATEGORY_CANONICAL = {
     'LARGE WIPES':            'WIPES',
     'POCKET WIPES':           'WIPES',
 }
+
+# Valid brand/category combinations within the tracked SOS category range.
+# This prevents zero/competitor rows in wide SFA exports from creating invalid
+# combinations such as ULTRA under SERVIETTES or COSY under SPONGE.
+UG_BRAND_CATEGORY_RULES = {
+    'FAY': {
+        'ALUMINUM FOILS', 'BABY WIPES', 'BAKING PAPER', 'CLING FILM',
+        'FACIALS', 'KITCHEN TOWELS', 'MULTIFOLDS HAND TOWELS',
+        'POCKET TISSUE', 'POCKET TISSUES', 'SERVIETTES',
+        'TOILET PAPER', 'WIPES',
+    },
+    'COSY':      {'SERVIETTES'},
+    'SIFA':      {'TOILET PAPER'},
+    'TISHU POA': {'TOILET PAPER'},
+    'ULTRA':     {
+        'ALL PURPOSE CLEANER', 'SPONGE', 'ULTRA SCOURERS',
+        'WASHROOM HYGIENE PRODUCTS',
+    },
+}
+
+UG_EXCLUDED_CATEGORIES = {'BAR SOAP'}
+
+def is_valid_sos_brand_category(brand: str, category: str) -> bool:
+    """Validate tracked SOS combinations; retain unknown/non-focus categories."""
+    b = UG_BRAND_ALIASES.get(str(brand).upper().strip(), str(brand).upper().strip())
+    raw_cat = str(category).upper().strip()
+    cat = UG_CATEGORY_CANONICAL.get(raw_cat, raw_cat)
+    if cat in UG_EXCLUDED_CATEGORIES:
+        return False
+    if b in UG_BRAND_CATEGORY_RULES:
+        return cat in UG_BRAND_CATEGORY_RULES[b]
+    return False
 
 # ── Brand matching — used by both OSA ('BRAND NAME') and SOS ('PRODUCT_NAME') ──
 # Exact prefixes derived from Items_Range_Uganda_March_26.xlsx
@@ -1423,18 +1491,45 @@ def process_sos(file_bytes: bytes, filename: str = "") -> pd.DataFrame:
     df = df[df['ACCOUNT'].notna()].copy()
 
     # ── STEP 5: Find CATEGORY column (optional) ───────────────────────────────
-    _CAT_KW = ['category', 'cat']
+    # Prefer columns with 'product' in name; skip anything with 'customer'
+    _SKIP_COLS = {'PRODUCT_NAME', 'FACINGS SOS%', 'DATE_PARSED', 'MONTH',
+                  'MONTH_NUM', 'CUSTOMER NAME', 'ACCOUNT'}
+    _cat_col_found = False
+    # First pass: look for 'product' + 'category' in header
     for col in df.columns:
-        if col in ('PRODUCT_NAME', 'FACINGS SOS%', 'DATE_PARSED', 'MONTH',
-                   'MONTH_NUM', 'CUSTOMER NAME', 'ACCOUNT'): continue
-        if any(kw in col.lower() for kw in _CAT_KW):
+        if col in _SKIP_COLS: continue
+        if 'customer' in col.lower(): continue  # skip customer category
+        cl = col.lower()
+        if 'product' in cl and 'cat' in cl:
             df['PRODUCT_CATEGORY'] = (
                 df[col].astype(str).str.upper().str.strip()
                 .map(lambda c: UG_CATEGORY_CANONICAL.get(c, c))
             )
+            _cat_col_found = True
             break
+    # Second pass: any column with 'category' but not 'customer'
+    if not _cat_col_found:
+        for col in df.columns:
+            if col in _SKIP_COLS: continue
+            if 'customer' in col.lower(): continue
+            if 'cat' in col.lower():
+                df['PRODUCT_CATEGORY'] = (
+                    df[col].astype(str).str.upper().str.strip()
+                    .map(lambda c: UG_CATEGORY_CANONICAL.get(c, c))
+                )
+                break
     if 'PRODUCT_CATEGORY' not in df.columns:
         df['PRODUCT_CATEGORY'] = 'UNKNOWN'
+
+    # Remove impossible brand/category pairs from wide SOS exports.
+    df = df[
+        df.apply(
+            lambda row: is_valid_sos_brand_category(
+                row['PRODUCT_NAME'], row['PRODUCT_CATEGORY']
+            ),
+            axis=1,
+        )
+    ].copy()
 
     # ── STEP 6: Find POSITION column (optional) ───────────────────────────────
     for col in df.columns:
@@ -1601,6 +1696,17 @@ def build_sos_excel(df: pd.DataFrame) -> bytes:
     """Build the formatted SOS Excel workbook from a processed DataFrame.
     Handles both survey format (has real months) and negotiated/snapshot format.
     """
+    # Apply the validation here too so previously saved data cannot regenerate
+    # invalid combinations after the processing rule has been corrected.
+    if {'PRODUCT_NAME', 'PRODUCT_CATEGORY'}.issubset(df.columns):
+        df = df[
+            df.apply(
+                lambda row: is_valid_sos_brand_category(
+                    row['PRODUCT_NAME'], row['PRODUCT_CATEGORY']
+                ),
+                axis=1,
+            )
+        ].copy()
     is_negotiated = df['MONTH'].eq('Snapshot').all() if 'MONTH' in df.columns else False
     if is_negotiated:
         return _build_sos_negotiated_excel(df)
@@ -1620,6 +1726,79 @@ def build_sos_excel(df: pd.DataFrame) -> bytes:
     # fallback
     for b in brands:
         brand_sos_target.setdefault(b, SOS_GREEN_THR)
+
+    def catbrand_block_data(account):
+        sub = df[df['ACCOUNT'] == account]
+        if sub.empty: return None, []
+        # (category, brand) pairs that actually exist for this account, category-ordered
+        pairs = (sub[['PRODUCT_CATEGORY', 'PRODUCT_NAME']].drop_duplicates())
+        pairs = pairs[pairs['PRODUCT_CATEGORY'].isin(cats)]
+        pairs = pairs.sort_values(['PRODUCT_CATEGORY', 'PRODUCT_NAME'])
+        row_order = list(pairs.itertuples(index=False, name=None))
+        sp = sub.groupby(['PRODUCT_CATEGORY', 'PRODUCT_NAME', 'MONTH'])['FACINGS SOS%'].mean().round(1)
+        r = {}
+        for cat, brand in row_order:
+            r[(cat, brand)] = {m: sp.get((cat, brand, m), np.nan) for m in months_ordered}
+        return r, row_order
+
+    def write_catbrand_block(ws, sr, sc, account, cbd, row_order):
+        nm = len(months_ordered); bc = 2 + nm + 1  # Category, Brand, months..., Avg
+        ws.merge_cells(start_row=sr, start_column=sc, end_row=sr, end_column=sc+bc-1)
+        c = ws.cell(sr, sc, f'{account} — Category × Brand')
+        c.font = Font(name='Calibri', bold=True, size=11, color='FFFFFF')
+        c.fill = PatternFill('solid', fgColor='1F4E79')
+        c.alignment = Alignment(horizontal='center', vertical='center'); c.border = _sos_bdr()
+        ws.row_dimensions[sr].height = 18
+        headers = ['Category', 'Brand'] + [m[:3] for m in months_ordered] + ['Avg']
+        for hi, h in enumerate(headers):
+            c = ws.cell(sr+1, sc+hi, h)
+            c.font = Font(name='Calibri', bold=True, size=9, color='1F4E79' if hi < 2 else ('375623' if hi==len(headers)-1 else '1F4E79'))
+            c.fill = PatternFill('solid', fgColor='E2EFDA' if hi==len(headers)-1 else 'D6E4F0')
+            c.alignment = Alignment(horizontal='center'); c.border = _sos_bdr()
+        ws.row_dimensions[sr+1].height = 16
+
+        row = sr + 2
+        prev_cat = None
+        cat_start_row = row
+        for cat, brand in row_order:
+            alt = PatternFill('solid', fgColor='F2F2F2') if row % 2 == 0 else PatternFill()
+            tgt = get_sos_target(cat)
+            if cat != prev_cat:
+                if prev_cat is not None and row - 1 > cat_start_row:
+                    ws.merge_cells(start_row=cat_start_row, start_column=sc, end_row=row-1, end_column=sc)
+                cat_start_row = row
+                prev_cat = cat
+            cc = ws.cell(row, sc, cat if row == cat_start_row else '')
+            cc.font = Font(name='Calibri', bold=True, size=9)
+            cc.fill = PatternFill('solid', fgColor='D6E4F0')
+            cc.alignment = Alignment(horizontal='left', indent=1, vertical='center'); cc.border = _sos_bdr()
+
+            bc2 = ws.cell(row, sc+1, brand)
+            bc2.font = Font(name='Calibri', size=9); bc2.fill = alt
+            bc2.alignment = Alignment(horizontal='left', indent=1, vertical='center'); bc2.border = _sos_bdr()
+
+            vals = []
+            for mi, month in enumerate(months_ordered):
+                sv = cbd[(cat, brand)][month]
+                c2 = ws.cell(row, sc+2+mi)
+                if pd.isna(sv):
+                    c2.value = '-'; c2.font = Font(name='Calibri', size=9, color='BFBFBF'); c2.fill = alt
+                else:
+                    c2.value = sv/100; c2.number_format = '0%'
+                    c2.fill = _sos_fill_xl(sv, tgt); c2.font = Font(name='Calibri', size=9)
+                    vals.append(sv)
+                c2.alignment = Alignment(horizontal='center', vertical='center'); c2.border = _sos_bdr()
+            av = round(np.mean(vals), 1) if vals else np.nan
+            c3 = ws.cell(row, sc+2+nm)
+            if pd.isna(av): c3.value = '-'; c3.font = Font(name='Calibri', size=9, color='BFBFBF'); c3.fill = alt
+            else:
+                c3.value = av/100; c3.number_format = '0%'
+                c3.fill = _sos_fill_xl(av, tgt); c3.font = Font(name='Calibri', size=9, bold=True)
+            c3.alignment = Alignment(horizontal='center', vertical='center'); c3.border = _sos_bdr()
+            row += 1
+        if row - 1 > cat_start_row:
+            ws.merge_cells(start_row=cat_start_row, start_column=sc, end_row=row-1, end_column=sc)
+        return row  # next free row
 
     def block_data(account):
         sub = df[df['ACCOUNT']==account]
@@ -1691,6 +1870,10 @@ def build_sos_excel(df: pd.DataFrame) -> bytes:
         for i in range(len(months_ordered)+1):
             ws_sum.column_dimensions[get_column_letter(base+1+i)].width=6
         if GAP_COLS: ws_sum.column_dimensions[get_column_letter(base+nc)].width=2
+    # ── Category setup (moved earlier so it's available for per-account sheets) ─
+    cats = sorted(df['PRODUCT_CATEGORY'].dropna().unique())
+    cats = [c for c in cats if c not in ('UNKNOWN', 'nan', '')]
+
     for idx,account in enumerate(accounts_with_data):
         ws=wb.create_sheet(account[:25]); ws.sheet_view.showGridLines=False
         bd=block_data(account)
@@ -1704,6 +1887,149 @@ def build_sos_excel(df: pd.DataFrame) -> bytes:
         write_block(ws,2,1,account,bd,idx)
         ws.column_dimensions[get_column_letter(1)].width=24
         for i in range(len(months_ordered)+1): ws.column_dimensions[get_column_letter(2+i)].width=12
+
+        # ── Category × Brand section, below the Brand section on the same tab ──
+        cbd, row_order = catbrand_block_data(account)
+        if cbd and row_order:
+            cb_start_row = 2 + (len(brands) + 3) + 2  # brand block height + gap
+            write_catbrand_block(ws, cb_start_row, 1, account, cbd, row_order)
+            ws.column_dimensions[get_column_letter(2)].width = 16
+    if cats:
+        HDR_CAT  = PatternFill('solid', fgColor='1F4E79')
+        HDR_MED2 = PatternFill('solid', fgColor='2E75B6')
+
+        ws_cat = wb.create_sheet('SOS by Category')
+        ws_cat.sheet_view.showGridLines = False
+        ws_cat.freeze_panes = 'B3'
+
+        title_cols = max(len(accounts_with_data) * len(months_ordered), 4)
+        ws_cat.merge_cells(start_row=1, start_column=1, end_row=1,
+                           end_column=1 + title_cols)
+        tc = ws_cat.cell(1, 1,
+            f'SOS% BY CATEGORY — {", ".join(months_ordered).upper()}')
+        tc.font = Font(name='Calibri', bold=True, size=13, color='FFFFFF')
+        tc.fill = HDR_CAT
+        tc.alignment = Alignment(horizontal='center', vertical='center')
+        ws_cat.row_dimensions[1].height = 22
+
+        # Header row: Category | Acct1/Mo1 | Acct1/Mo2 | … | Acct2/Mo1 | …
+        ws_cat.cell(2, 1, 'CATEGORY').font = Font(name='Calibri', bold=True, size=9, color='FFFFFF')
+        ws_cat.cell(2, 1).fill = HDR_CAT
+        ws_cat.cell(2, 1).border = _sos_bdr()
+        ws_cat.cell(2, 1).alignment = Alignment(horizontal='center')
+        ws_cat.column_dimensions['A'].width = 28
+        col_idx = 2
+        acct_month_cols = []  # (account, month, col)
+        for ai, acct in enumerate(accounts_with_data):
+            for mi, month in enumerate(months_ordered):
+                lbl = f'{acct[:12]}\n{month[:3]}'
+                c = ws_cat.cell(2, col_idx, lbl)
+                c.font = Font(name='Calibri', bold=True, size=8, color='FFFFFF')
+                c.fill = HDR_MED2 if ai % 2 == 0 else HDR_CAT
+                c.alignment = Alignment(horizontal='center', wrap_text=True)
+                c.border = _sos_bdr()
+                ws_cat.column_dimensions[get_column_letter(col_idx)].width = 9
+                acct_month_cols.append((acct, month, col_idx))
+                col_idx += 1
+        ws_cat.row_dimensions[2].height = 28
+
+        for ri, cat in enumerate(cats, 3):
+            alt = PatternFill('solid', fgColor='EBF3FB') if ri % 2 == 0 else PatternFill()
+            c = ws_cat.cell(ri, 1, cat)
+            c.font = Font(name='Calibri', bold=True, size=9)
+            c.fill = alt; c.border = _sos_bdr()
+            c.alignment = Alignment(horizontal='left', indent=1)
+            for acct, month, ci in acct_month_cols:
+                sub = df[(df['PRODUCT_CATEGORY'] == cat) &
+                         (df['ACCOUNT'] == acct) &
+                         (df['MONTH'] == month)]
+                val = sub['FACINGS SOS%'].mean() if not sub.empty else np.nan
+                cv = ws_cat.cell(ri, ci)
+                if pd.isna(val):
+                    cv.value = '-'
+                    cv.font = Font(name='Calibri', size=9, color='BFBFBF')
+                    cv.fill = alt
+                else:
+                    tgt = get_sos_target(cat)
+                    cv.value = val / 100
+                    cv.number_format = '0%'
+                    cv.fill = _sos_fill_xl(val, tgt)
+                    cv.font = Font(name='Calibri', size=9)
+                cv.alignment = Alignment(horizontal='center', vertical='center')
+                cv.border = _sos_bdr()
+            ws_cat.row_dimensions[ri].height = 14
+
+    # ── Sheet: Category × Brand detail (per month) ───────────────────────────
+    if cats:
+        ws_cbd = wb.create_sheet('Category × Brand')
+        ws_cbd.sheet_view.showGridLines = False
+        ws_cbd.freeze_panes = 'C3'
+
+        ws_cbd.merge_cells(start_row=1, start_column=1, end_row=1,
+                           end_column=2 + len(accounts_with_data))
+        tc2 = ws_cbd.cell(1, 1,
+            f'SOS% — CATEGORY × BRAND × ACCOUNT — {", ".join(months_ordered).upper()}')
+        tc2.font = Font(name='Calibri', bold=True, size=13, color='FFFFFF')
+        tc2.fill = PatternFill('solid', fgColor='1F4E79')
+        tc2.alignment = Alignment(horizontal='center', vertical='center')
+        ws_cbd.row_dimensions[1].height = 22
+
+        # Header: Category | Brand | Acct1 | Acct2 | …
+        for ci2, hdr in enumerate(['CATEGORY', 'BRAND'] + accounts_with_data, 1):
+            c = ws_cbd.cell(2, ci2, hdr)
+            c.font = Font(name='Calibri', bold=True, size=9, color='FFFFFF')
+            c.fill = PatternFill('solid', fgColor='1F4E79' if ci2 <= 2 else '2E75B6')
+            c.alignment = Alignment(horizontal='center', wrap_text=True)
+            c.border = _sos_bdr()
+        ws_cbd.column_dimensions['A'].width = 26
+        ws_cbd.column_dimensions['B'].width = 14
+        for ci2 in range(3, 3 + len(accounts_with_data)):
+            ws_cbd.column_dimensions[get_column_letter(ci2)].width = 11
+        ws_cbd.row_dimensions[2].height = 26
+
+        row = 3
+        for cat in cats:
+            cat_brands = sorted(df[df['PRODUCT_CATEGORY'] == cat]['PRODUCT_NAME'].unique())
+            if not cat_brands:
+                continue
+            first = True
+            for brand in cat_brands:
+                alt = PatternFill('solid', fgColor='EBF3FB') if row % 2 == 0 else PatternFill()
+                # Category cell — merge vertically on first brand
+                cc = ws_cbd.cell(row, 1, cat if first else '')
+                cc.font = Font(name='Calibri', bold=True, size=9)
+                cc.fill = PatternFill('solid', fgColor='D6E4F0')
+                cc.alignment = Alignment(horizontal='left', indent=1, vertical='center')
+                cc.border = _sos_bdr()
+                first = False
+
+                bc = ws_cbd.cell(row, 2, brand)
+                bc.font = Font(name='Calibri', size=9)
+                bc.fill = alt; bc.border = _sos_bdr()
+                bc.alignment = Alignment(horizontal='left', indent=1)
+
+                for ai2, acct in enumerate(accounts_with_data, 3):
+                    sub2 = df[(df['PRODUCT_CATEGORY'] == cat) &
+                              (df['PRODUCT_NAME'] == brand) &
+                              (df['ACCOUNT'] == acct)]
+                    val2 = sub2['FACINGS SOS%'].mean() if not sub2.empty else np.nan
+                    cv2 = ws_cbd.cell(row, ai2)
+                    if pd.isna(val2):
+                        cv2.value = '-'
+                        cv2.font = Font(name='Calibri', size=9, color='BFBFBF')
+                        cv2.fill = alt
+                    else:
+                        tgt2 = get_sos_target(cat)
+                        cv2.value = val2 / 100
+                        cv2.number_format = '0%'
+                        cv2.fill = _sos_fill_xl(val2, tgt2)
+                        cv2.font = Font(name='Calibri', size=9)
+                    cv2.alignment = Alignment(horizontal='center', vertical='center')
+                    cv2.border = _sos_bdr()
+                ws_cbd.row_dimensions[row].height = 14
+                row += 1
+
+
     wl=wb.create_sheet('Legend'); wl.merge_cells('A1:B1')
     wl['A1']='SOS REPORT — LEGEND & METHODOLOGY'
     wl['A1'].font=Font(name='Calibri',bold=True,size=13,color='FFFFFF')

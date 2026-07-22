@@ -79,7 +79,7 @@ def _safe_process_osa(file_bytes, filename, targets):
 st.markdown("""
 <div class="rg-card">
   <h3>🟢 OSA Report — On-Shelf Availability</h3>
-  <p>One tab per month: Brand OSA · Category OSA · Account × Brand · Account × Category · Legend</p>
+  <p>One tab per month: Brand OSA · Category OSA · SKU OSA · Account × Brand · Account × Category · Account × SKU · Legend</p>
 </div>
 """, unsafe_allow_html=True)
 

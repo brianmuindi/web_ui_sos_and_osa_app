@@ -17,6 +17,7 @@ from engines import (
     UG_FOCUS_CATEGORIES, UG_SOS_TARGETS, UG_BRANDS,
     inject_sidebar_toggle, inject_theme_toggle, get_sos_target,
     UG_CATEGORY_CANONICAL, is_ug_brand,
+    is_valid_sos_brand_category,
     sos_data_save, sos_data_load, sos_data_clear,
 )
 from auth import require_login, logout
@@ -139,6 +140,15 @@ ALLOWED_BRANDS = set(UG_BRANDS) | {'COSY POA', 'TISHU POA', 'ULTRA CLEAN'}
 # Double-check — paranoia filter (should never trigger given process_sos rebuild)
 from engines import is_ug_brand
 df = df[df['PRODUCT_NAME'].apply(is_ug_brand)].copy()
+if 'PRODUCT_CATEGORY' in df.columns:
+    df = df[
+        df.apply(
+            lambda row: is_valid_sos_brand_category(
+                row['PRODUCT_NAME'], row['PRODUCT_CATEGORY']
+            ),
+            axis=1,
+        )
+    ].copy()
 
 if df.empty:
     st.error("❌ No Uganda brand data found in this file. Please upload the correct SOS export.")
@@ -515,6 +525,13 @@ with h4b:
                  .mean().round(1).reset_index()
                  .pivot(index='ACCOUNT', columns='PRODUCT_CATEGORY', values='FACINGS SOS%'))
     st.plotly_chart(_sos_heatmap(hp_cat, "Account × Category SOS (%)"), use_container_width=True)
+
+# ── Row 4c: Category × Brand heatmap (both dimensions at once) ──────────────
+st.markdown('<div class="sec-label">Category × Brand Heatmap</div>', unsafe_allow_html=True)
+hp_cat_brand = (dff_cat.groupby(['PRODUCT_CATEGORY','PRODUCT_NAME'])['FACINGS SOS%']
+                    .mean().round(1).reset_index()
+                    .pivot(index='PRODUCT_CATEGORY', columns='PRODUCT_NAME', values='FACINGS SOS%'))
+st.plotly_chart(_sos_heatmap(hp_cat_brand, "Category × Brand SOS (%)"), use_container_width=True)
 
 # ── Row 5: Shelf Position  +  Brand Presence ─────────────────────────────────
 
